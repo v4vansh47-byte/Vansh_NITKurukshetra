@@ -1,5 +1,5 @@
 import os
-import json
+import re
 import time
 import tempfile
 import shutil
@@ -7,8 +7,7 @@ import requests
 import uvicorn
 from typing import List, Literal, Optional, Any
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, BeforeValidator
-from typing_extensions import Annotated
+from pydantic import BaseModel
 import google.generativeai as genai
 from dotenv import load_dotenv
 
@@ -20,56 +19,42 @@ if not GENAI_API_KEY:
     raise ValueError("GOOGLE_API_KEY not found.")
 
 genai.configure(api_key=GENAI_API_KEY)
-MODEL_NAME = "gemini-1.5-pro" # Reliable choice
+MODEL_NAME = "gemini-2.5-pro" 
 
 app = FastAPI(title="HackRx Bill Extractor")
 
-# --- 2. HELPERS ---
-def parse_float(v: Any) -> float:
-    if v is None: return 0.0
-    if isinstance(v, (float, int)): return float(v)
-    if isinstance(v, str):
-        clean_v = v.replace(",", "").replace("$", "").replace("₹", "").replace("Rs.", "").strip()
-        if not clean_v: return 0.0
-        try: return float(clean_v)
-        except: return 0.0
-    return 0.0
-
-FlexibleFloat = Annotated[float, BeforeValidator(parse_float)]
-
-# --- 3. API RESPONSE SCHEMA (Strict for Postman) ---
+# --- 2. SCHEMAS ---
 class BillItem(BaseModel):
-    item_name: str = Field(..., description="Name of the item")
-    item_amount: FlexibleFloat = Field(..., description="Net Amount")
-    item_rate: FlexibleFloat = Field(0.0, description="Unit Rate")
-    item_quantity: FlexibleFloat = Field(1.0, description="Quantity")
+    item_name: str
+    item_amount: float
+    item_rate: float
+    item_quantity: float
 
 class PageLineItems(BaseModel):
-    page_no: str = Field(..., description="Page number as STRING")
-    page_type: Literal["Bill Detail", "Final Bill", "Pharmacy", "Summary", "Unknown"]
-    bill_items: List[BillItem] = Field(default_factory=list)
+    page_no: str
+    page_type: str
+    bill_items: List[BillItem]
 
 class ExtractionData(BaseModel):
     pagewise_line_items: List[PageLineItems]
+    total_item_count: int
 
 class TokenUsage(BaseModel):
-    total_tokens: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
+    total_tokens: int
+    input_tokens: int
+    output_tokens: int
 
 class APIResponse(BaseModel):
     is_success: bool
     token_usage: Optional[TokenUsage] = None
     data: Optional[ExtractionData] = None
-    total_item_count: Optional[int] = None
     error_msg: Optional[str] = None
 
 class UserRequest(BaseModel):
     document: str
 
-# --- 4. DOWNLOADER ---
+# --- 3. UTILS ---
 def download_file(url_or_path: str) -> str:
-    r"""Handles local paths and URLs."""
     if os.path.exists(url_or_path):
         _, ext = os.path.splitext(url_or_path)
         if not ext: ext = ".pdf"
@@ -90,10 +75,37 @@ def download_file(url_or_path: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
 
-# --- 5. GEMINI LOGIC (FIXED SCHEMA) ---
-def analyze_document_with_retry(file_path: str, retries=3):
+# --- 4. REGEX PARSING LOGIC ---
+def parse_gemini_text_response(text: str):
+    """
+    Parses the raw text response using Regex.
+    Expected format from AI: "1 | Paracetamol | 50.0 | 2.0 | 100.0"
+    """
+    items = []
+    # Regex Pattern: Page | Name | Rate | Qty | Amount
+    pattern = re.compile(r"^\d+\s*\|\s*(.*?)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)", re.MULTILINE)
+
+    for match in pattern.finditer(text):
+        try:
+            name = match.group(1).strip()
+            rate = float(match.group(2))
+            qty = float(match.group(3))
+            amount = float(match.group(4))
+            
+            items.append(BillItem(
+                item_name=name,
+                item_amount=amount,
+                item_rate=rate,
+                item_quantity=qty
+            ))
+        except:
+            continue
+            
+    return items
+
+# --- 5. AI ENGINE (Regex Mode) ---
+def analyze_document_regex(file_path: str, retries=3):
     mime_type = "application/pdf" if file_path.endswith(".pdf") else "image/jpeg"
-    
     uploaded_file = genai.upload_file(file_path, mime_type=mime_type)
     
     while uploaded_file.state.name == "PROCESSING":
@@ -101,51 +113,34 @@ def analyze_document_with_retry(file_path: str, retries=3):
         uploaded_file = genai.get_file(uploaded_file.name)
     
     if uploaded_file.state.name == "FAILED":
-        raise ValueError("Gemini failed to process file.")
+        raise ValueError("Gemini failed.")
 
-    # --- CRITICAL FIX: Explicit System Prompt instead of Pydantic Schema ---
-    # We remove 'response_schema' from generation_config to avoid the "Unknown field" error.
-    # We force JSON mode via 'response_mime_type' and a strong prompt.
-    
     system_instruction = """
-    You are a data extractor. 
-    TASK: Extract every single row from the item tables in this document.
+    You are a bill extractor. Extract table rows.
     
-    OUTPUT FORMAT:
-    You must return a JSON Array of objects.
-    Example:
-    [
-      {
-        "page_no": "1",
-        "page_type": "Pharmacy",
-        "bill_items": [
-          {"item_name": "A", "item_amount": 10.0, "item_rate": 5.0, "item_quantity": 2.0}
-        ]
-      }
-    ]
+    OUTPUT FORMAT (Strict Text):
+    For every item row found, output a single line in this format:
+    PageNumber | ItemName | Rate | Quantity | NetAmount
+    
+    Example Output:
+    1 | Paracetamol | 10.50 | 2.0 | 21.00
+    1 | Consultation | 500.0 | 1.0 | 500.00
     
     RULES:
-    1. Extract all items found in tables.
-    2. Columns: Name, Rate, Qty, Amount.
-    3. Exclude 'Grand Total' lines.
+    1. Do not use JSON. Use the pipe separator format above.
+    2. Extract all items.
+    3. Ignore Grand Totals.
     """
 
     model = genai.GenerativeModel(
         model_name=MODEL_NAME,
-        generation_config={
-            "temperature": 0.1, 
-            "response_mime_type": "application/json",
-            # REMOVED response_schema to fix the Render error
-        },
+        generation_config={"temperature": 0.1}, 
         system_instruction=system_instruction
     )
 
     for attempt in range(retries):
         try:
-            response = model.generate_content(
-                [uploaded_file, "Extract all table rows."],
-                request_options={"timeout": 600}
-            )
+            response = model.generate_content([uploaded_file, "Extract items."])
             try: genai.delete_file(uploaded_file.name)
             except: pass
             return response
@@ -155,7 +150,7 @@ def analyze_document_with_retry(file_path: str, retries=3):
 
     try: genai.delete_file(uploaded_file.name)
     except: pass
-    raise ValueError("Gemini API failed.")
+    raise ValueError("Gemini failed.")
 
 # --- 6. ENDPOINT ---
 @app.post("/extract-bill-data", response_model=APIResponse, response_model_exclude_none=True)
@@ -164,17 +159,19 @@ async def extract_bill_data(request: UserRequest):
     try:
         temp_file_path = download_file(request.document)
         
-        # Call Gemini
-        gemini_response = analyze_document_with_retry(temp_file_path)
+        # 1. Get Raw Text from AI
+        gemini_response = analyze_document_regex(temp_file_path)
+        raw_text = gemini_response.text
         
-        # Parse JSON manually since we removed schema enforcement
-        extracted_pages = json.loads(gemini_response.text)
+        # 2. Parse Text with Regex
+        items = parse_gemini_text_response(raw_text)
         
-        # Validate logic (ensure it's a list)
-        if isinstance(extracted_pages, dict):
-            extracted_pages = [extracted_pages]
-            
-        total_count = sum(len(p.get('bill_items', [])) for p in extracted_pages)
+        # 3. Construct Response 
+        page_data = PageLineItems(
+            page_no="1",
+            page_type="Bill Detail",
+            bill_items=items
+        )
         
         usage = gemini_response.usage_metadata
         token_usage = TokenUsage(
@@ -186,8 +183,10 @@ async def extract_bill_data(request: UserRequest):
         return APIResponse(
             is_success=True,
             token_usage=token_usage,
-            data=ExtractionData(pagewise_line_items=extracted_pages),
-            total_item_count=total_count
+            data=ExtractionData(
+                pagewise_line_items=[page_data],
+                total_item_count=len(items)
+            )
         )
 
     except Exception as e:
