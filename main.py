@@ -12,6 +12,7 @@ from typing_extensions import Annotated
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+# --- 1. CONFIGURATION ---
 load_dotenv()
 GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
 
@@ -19,10 +20,11 @@ if not GENAI_API_KEY:
     raise ValueError("GOOGLE_API_KEY not found.")
 
 genai.configure(api_key=GENAI_API_KEY)
-MODEL_NAME = "gemini-2.5-pro"
+MODEL_NAME = "gemini-1.5-pro" # Reliable choice
 
 app = FastAPI(title="HackRx Bill Extractor")
 
+# --- 2. HELPERS ---
 def parse_float(v: Any) -> float:
     if v is None: return 0.0
     if isinstance(v, (float, int)): return float(v)
@@ -35,6 +37,7 @@ def parse_float(v: Any) -> float:
 
 FlexibleFloat = Annotated[float, BeforeValidator(parse_float)]
 
+# --- 3. API RESPONSE SCHEMA (Strict for Postman) ---
 class BillItem(BaseModel):
     item_name: str = Field(..., description="Name of the item")
     item_amount: FlexibleFloat = Field(..., description="Net Amount")
@@ -64,6 +67,7 @@ class APIResponse(BaseModel):
 class UserRequest(BaseModel):
     document: str
 
+# --- 4. DOWNLOADER ---
 def download_file(url_or_path: str) -> str:
     r"""Handles local paths and URLs."""
     if os.path.exists(url_or_path):
@@ -86,6 +90,7 @@ def download_file(url_or_path: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
 
+# --- 5. GEMINI LOGIC (FIXED SCHEMA) ---
 def analyze_document_with_retry(file_path: str, retries=3):
     mime_type = "application/pdf" if file_path.endswith(".pdf") else "image/jpeg"
     
@@ -98,14 +103,31 @@ def analyze_document_with_retry(file_path: str, retries=3):
     if uploaded_file.state.name == "FAILED":
         raise ValueError("Gemini failed to process file.")
 
+    # --- CRITICAL FIX: Explicit System Prompt instead of Pydantic Schema ---
+    # We remove 'response_schema' from generation_config to avoid the "Unknown field" error.
+    # We force JSON mode via 'response_mime_type' and a strong prompt.
+    
     system_instruction = """
     You are a data extractor. 
     TASK: Extract every single row from the item tables in this document.
+    
+    OUTPUT FORMAT:
+    You must return a JSON Array of objects.
+    Example:
+    [
+      {
+        "page_no": "1",
+        "page_type": "Pharmacy",
+        "bill_items": [
+          {"item_name": "A", "item_amount": 10.0, "item_rate": 5.0, "item_quantity": 2.0}
+        ]
+      }
+    ]
+    
     RULES:
-    1. Extract all items, medicines, or services found in tables.
-    2. Do NOT ignore valid items. 
-    3. Columns: Name, Rate, Qty, Amount.
-    4. Exclude: 'Grand Total' or 'Sub Total' lines if possible.
+    1. Extract all items found in tables.
+    2. Columns: Name, Rate, Qty, Amount.
+    3. Exclude 'Grand Total' lines.
     """
 
     model = genai.GenerativeModel(
@@ -113,7 +135,7 @@ def analyze_document_with_retry(file_path: str, retries=3):
         generation_config={
             "temperature": 0.1, 
             "response_mime_type": "application/json",
-            "response_schema": list[PageLineItems], 
+            # REMOVED response_schema to fix the Render error
         },
         system_instruction=system_instruction
     )
@@ -135,15 +157,23 @@ def analyze_document_with_retry(file_path: str, retries=3):
     except: pass
     raise ValueError("Gemini API failed.")
 
+# --- 6. ENDPOINT ---
 @app.post("/extract-bill-data", response_model=APIResponse, response_model_exclude_none=True)
 async def extract_bill_data(request: UserRequest):
     temp_file_path = None
     try:
         temp_file_path = download_file(request.document)
-
+        
+        # Call Gemini
         gemini_response = analyze_document_with_retry(temp_file_path)
+        
+        # Parse JSON manually since we removed schema enforcement
         extracted_pages = json.loads(gemini_response.text)
         
+        # Validate logic (ensure it's a list)
+        if isinstance(extracted_pages, dict):
+            extracted_pages = [extracted_pages]
+            
         total_count = sum(len(p.get('bill_items', [])) for p in extracted_pages)
         
         usage = gemini_response.usage_metadata
