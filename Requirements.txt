@@ -1,1 +1,10 @@
-
+fastapi
+uvicorn
+google-generativeai
+pydantic
+requests
+python-multipart
+python-dotenv
+pymupdf
+easyocr
+opencv-python-headless
