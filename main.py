@@ -1,222 +1,172 @@
 import os
-import re
-import io
 import json
 import time
-import fitz
-import requests
 import tempfile
+import shutil
+import requests
 import uvicorn
-from typing import List
+from typing import List, Literal, Optional, Any
 from fastapi import FastAPI, HTTPException
-from dotenv import load_dotenv
+from pydantic import BaseModel, Field, BeforeValidator
+from typing_extensions import Annotated
 import google.generativeai as genai
-from PIL import Image
+from dotenv import load_dotenv
 
 load_dotenv()
-API_KEY = os.getenv("GOOGLE_API_KEY")
+GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-if not API_KEY:
-    raise ValueError("GOOGLE_API_KEY missing from .env")
+if not GENAI_API_KEY:
+    raise ValueError("GOOGLE_API_KEY not found.")
 
-genai.configure(api_key=API_KEY)
-MODEL = "gemini-2.5-pro"
+genai.configure(api_key=GENAI_API_KEY)
+MODEL_NAME = "gemini-2.5-pro"
 
-app = FastAPI(title="HackRx Bill Extraction API")
+app = FastAPI(title="HackRx Bill Extractor")
 
-def download_document(path_or_url: str) -> str:
-    """Downloads remote URL or copies local path → temp file"""
-    if os.path.exists(path_or_url):
-        _, ext = os.path.splitext(path_or_url)
+def parse_float(v: Any) -> float:
+    if v is None: return 0.0
+    if isinstance(v, (float, int)): return float(v)
+    if isinstance(v, str):
+        clean_v = v.replace(",", "").replace("$", "").replace("₹", "").replace("Rs.", "").strip()
+        if not clean_v: return 0.0
+        try: return float(clean_v)
+        except: return 0.0
+    return 0.0
+
+FlexibleFloat = Annotated[float, BeforeValidator(parse_float)]
+
+class BillItem(BaseModel):
+    item_name: str = Field(..., description="Name of the item")
+    item_amount: FlexibleFloat = Field(..., description="Net Amount")
+    item_rate: FlexibleFloat = Field(0.0, description="Unit Rate")
+    item_quantity: FlexibleFloat = Field(1.0, description="Quantity")
+
+class PageLineItems(BaseModel):
+    page_no: str = Field(..., description="Page number as STRING")
+    page_type: Literal["Bill Detail", "Final Bill", "Pharmacy", "Summary", "Unknown"]
+    bill_items: List[BillItem] = Field(default_factory=list)
+
+class ExtractionData(BaseModel):
+    pagewise_line_items: List[PageLineItems]
+
+class TokenUsage(BaseModel):
+    total_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+class APIResponse(BaseModel):
+    is_success: bool
+    token_usage: Optional[TokenUsage] = None
+    data: Optional[ExtractionData] = None
+    total_item_count: Optional[int] = None
+    error_msg: Optional[str] = None
+
+class UserRequest(BaseModel):
+    document: str
+
+def download_file(url_or_path: str) -> str:
+    r"""Handles local paths and URLs."""
+    if os.path.exists(url_or_path):
+        _, ext = os.path.splitext(url_or_path)
         if not ext: ext = ".pdf"
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            with open(path_or_url, "rb") as f:
-                tmp.write(f.read())
+            shutil.copy2(url_or_path, tmp.name)
             return tmp.name
 
     try:
-        r = requests.get(path_or_url, timeout=25)
-        r.raise_for_status()
-
-        content_type = r.headers.get("content-type", "")
-        if "pdf" in content_type:
-            ext = ".pdf"
-        elif "png" in content_type:
-            ext = ".png"
-        elif "jpeg" in content_type:
-            ext = ".jpg"
-        else:
-            ext = ".pdf" # Default fallback
-
+        response = requests.get(url_or_path, stream=True, timeout=30)
+        response.raise_for_status()
+        content_type = response.headers.get('content-type', '')
+        ext = '.pdf' if 'pdf' in content_type else '.jpg'
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(r.content)
+            for chunk in response.iter_content(chunk_size=8192):
+                tmp.write(chunk)
             return tmp.name
     except Exception as e:
-         raise HTTPException(400, f"Failed to download: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
 
-
-def pdf_to_images(file_path: str) -> List[Image.Image]:
-    """Convert PDF → list of PIL images"""
-    doc = fitz.open(file_path)
-    pages = []
-    for p in doc:
-        pix = p.get_pixmap(dpi=300)
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
-        pages.append(img)
-    doc.close()
-    return pages
-
-EXTRACTION_PROMPT = """
-Extract line items from this bill page.
-
-RULES:
-- Extract ONLY line items (ignore totals)
-- For each item, extract:
-  - item_name (exact)
-  - qty
-  - rate
-  - amount (net)
-- Detect page type: "Pharmacy", "Bill Detail", "Final Bill"
-
-OUTPUT FORMAT (NOT JSON):
-
-PAGE <page_no> - <PAGE_TYPE>
-1. <item_name> | qty:<qty> | rate:<rate> | amount:<amount>
-2. <item_name> | qty:<qty> | rate:<rate> | amount:<amount>
-"""
-
-generation_config = genai.types.GenerationConfig(
-    temperature=0,
-    top_p=1,
-    top_k=1,
-)
-
-def ask_gemini(img: Image.Image, page_no: int):
-    model = genai.GenerativeModel(
-        model_name=MODEL,
-        generation_config=generation_config
-    )
-
-    response = model.generate_content(
-        contents=[
-            EXTRACTION_PROMPT.replace("<page_no>", str(page_no)),
-            img
-        ]
-    )
+def analyze_document_with_retry(file_path: str, retries=3):
+    mime_type = "application/pdf" if file_path.endswith(".pdf") else "image/jpeg"
     
-    return response.text, response.usage_metadata
+    uploaded_file = genai.upload_file(file_path, mime_type=mime_type)
+    
+    while uploaded_file.state.name == "PROCESSING":
+        time.sleep(1)
+        uploaded_file = genai.get_file(uploaded_file.name)
+    
+    if uploaded_file.state.name == "FAILED":
+        raise ValueError("Gemini failed to process file.")
 
-def parse_page_type(text: str) -> str:
-    m = re.search(r"PAGE\s*\d+\s*-\s*(Pharmacy|Bill Detail|Final Bill)", text, re.IGNORECASE)
-    if not m:
-        return "Bill Detail"
-    label = m.group(1).strip()
-    if "pharm" in label.lower():
-        return "Pharmacy"
-    if "final" in label.lower():
-        return "Final Bill"
-    return "Bill Detail"
+    system_instruction = """
+    You are a data extractor. 
+    TASK: Extract every single row from the item tables in this document.
+    RULES:
+    1. Extract all items, medicines, or services found in tables.
+    2. Do NOT ignore valid items. 
+    3. Columns: Name, Rate, Qty, Amount.
+    4. Exclude: 'Grand Total' or 'Sub Total' lines if possible.
+    """
 
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        generation_config={
+            "temperature": 0.1, 
+            "response_mime_type": "application/json",
+            "response_schema": list[PageLineItems], 
+        },
+        system_instruction=system_instruction
+    )
 
-ITEM_REGEX = re.compile(
-    r"\d+\.\s*(.*?)\s*\|\s*qty\s*:\s*([\d\.]+)\s*\|\s*rate\s*:\s*([\d\.]+)\s*\|\s*amount\s*:\s*([\d\.]+)",
-    re.IGNORECASE
-)
-
-
-def parse_items(text: str):
-    items = []
-    for m in ITEM_REGEX.finditer(text):
-        name = m.group(1).strip()
-
+    for attempt in range(retries):
         try:
-            qty = float(m.group(2))
-        except: qty = 1.0
-            
-        try:
-            rate = float(m.group(3))
-        except: rate = 0.0
-            
-        try:
-            amt = float(m.group(4))
-        except: amt = 0.0
+            response = model.generate_content(
+                [uploaded_file, "Extract all table rows."],
+                request_options={"timeout": 600}
+            )
+            try: genai.delete_file(uploaded_file.name)
+            except: pass
+            return response
+        except Exception as e:
+            print(f"Retry {attempt+1}: {e}")
+            time.sleep(2)
 
-        items.append({
-            "item_name": name,
-            "item_amount": amt,
-            "item_rate": rate,
-            "item_quantity": qty
-        })
-    return items
+    try: genai.delete_file(uploaded_file.name)
+    except: pass
+    raise ValueError("Gemini API failed.")
 
-@app.post("/extract-bill-data")
-async def extract_bill_data(req: dict):
-    document_url = req.get("document")
-    if not document_url:
-        raise HTTPException(400, "Missing 'document' field")
-
-    temp_path = None
-
+@app.post("/extract-bill-data", response_model=APIResponse, response_model_exclude_none=True)
+async def extract_bill_data(request: UserRequest):
+    temp_file_path = None
     try:
-        temp_path = download_document(document_url)
+        temp_file_path = download_file(request.document)
 
-        pages = pdf_to_images(temp_path)
+        gemini_response = analyze_document_with_retry(temp_file_path)
+        extracted_pages = json.loads(gemini_response.text)
+        
+        total_count = sum(len(p.get('bill_items', [])) for p in extracted_pages)
+        
+        usage = gemini_response.usage_metadata
+        token_usage = TokenUsage(
+            total_tokens=usage.total_token_count,
+            input_tokens=usage.prompt_token_count,
+            output_tokens=usage.candidates_token_count
+        )
 
-        pagewise_output = []
-        total_items = 0
-
-        total_input_tokens = 0
-        total_output_tokens = 0
-
-        for i, page_img in enumerate(pages, start=1):
-            text, usage = ask_gemini(page_img, i)
-            
-            if usage:
-                total_input_tokens += usage.prompt_token_count
-                total_output_tokens += usage.candidates_token_count
-
-            page_type = parse_page_type(text)
-            items = parse_items(text)
-            total_items += len(items)
-
-            pagewise_output.append({
-                "page_no": str(i),
-                "page_type": page_type,
-                "bill_items": items
-            })
-
-        return {
-            "is_success": True,
-            "token_usage": {
-                "total_tokens": total_input_tokens + total_output_tokens,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens
-            },
-            "data": {
-                "pagewise_line_items": pagewise_output,
-                "total_item_count": total_items
-            }
-        }
+        return APIResponse(
+            is_success=True,
+            token_usage=token_usage,
+            data=ExtractionData(pagewise_line_items=extracted_pages),
+            total_item_count=total_count
+        )
 
     except Exception as e:
         print(f"Error: {e}")
-        return {
-            "is_success": False,
-            "data": None,
-            "token_usage": {
-                "total_tokens": 0,
-                "input_tokens": 0,
-                "output_tokens": 0
-            },
-            "error_msg": str(e)
-        }
-
+        return APIResponse(is_success=False, data=None, error_msg=str(e))
+    
     finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except:
-                pass
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
