@@ -1,48 +1,62 @@
 import os
-import re
+import json
 import time
 import tempfile
 import shutil
 import requests
 import uvicorn
+import easyocr
+import numpy as np
+import fitz
 from typing import List, Literal, Optional, Any
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, BeforeValidator
+from typing_extensions import Annotated
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# --- 1. CONFIGURATION ---
 load_dotenv()
 GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
-
 if not GENAI_API_KEY:
     raise ValueError("GOOGLE_API_KEY not found.")
 
 genai.configure(api_key=GENAI_API_KEY)
-MODEL_NAME = "gemini-2.5-pro" 
+MODEL_NAME = "gemini-2.5-pro"
 
+reader = easyocr.Reader(['en'], gpu=False)
 app = FastAPI(title="HackRx Bill Extractor")
 
-# --- 2. SCHEMAS ---
+def parse_float(v: Any) -> float:
+    if v is None: return 0.0
+    if isinstance(v, (float, int)): return float(v)
+    if isinstance(v, str):
+        clean_v = v.replace(",", "").replace("$", "").replace("₹", "").replace("Rs.", "").strip()
+        if not clean_v: return 0.0
+        try: return float(clean_v)
+        except ValueError: return 0.0
+    return 0.0
+
+FlexibleFloat = Annotated[float, BeforeValidator(parse_float)]
+
 class BillItem(BaseModel):
     item_name: str
-    item_amount: float
-    item_rate: float
-    item_quantity: float
+    item_amount: FlexibleFloat
+    item_rate: FlexibleFloat = 0.0
+    item_quantity: FlexibleFloat = 1.0
 
 class PageLineItems(BaseModel):
     page_no: str
-    page_type: str
-    bill_items: List[BillItem]
+    page_type: Literal["Bill Detail", "Final Bill", "Pharmacy", "Summary", "Unknown"]
+    bill_items: List[BillItem] = Field(default_factory=list)
 
 class ExtractionData(BaseModel):
     pagewise_line_items: List[PageLineItems]
     total_item_count: int
 
 class TokenUsage(BaseModel):
-    total_tokens: int
-    input_tokens: int
-    output_tokens: int
+    total_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 class APIResponse(BaseModel):
     is_success: bool
@@ -53,7 +67,6 @@ class APIResponse(BaseModel):
 class UserRequest(BaseModel):
     document: str
 
-# --- 3. UTILS ---
 def download_file(url_or_path: str) -> str:
     if os.path.exists(url_or_path):
         _, ext = os.path.splitext(url_or_path)
@@ -67,7 +80,6 @@ def download_file(url_or_path: str) -> str:
         response.raise_for_status()
         content_type = response.headers.get('content-type', '')
         ext = '.pdf' if 'pdf' in content_type else '.jpg'
-        
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             for chunk in response.iter_content(chunk_size=8192):
                 tmp.write(chunk)
@@ -75,127 +87,124 @@ def download_file(url_or_path: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
 
-# --- 4. REGEX PARSING LOGIC ---
-def parse_gemini_text_response(text: str):
-    """
-    Parses the raw text response using Regex.
-    Expected format from AI: "1 | Paracetamol | 50.0 | 2.0 | 100.0"
-    """
-    items = []
-    # Regex Pattern: Page | Name | Rate | Qty | Amount
-    pattern = re.compile(r"^\d+\s*\|\s*(.*?)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)", re.MULTILINE)
+def perform_ocr(file_path: str) -> List[str]:
+    ocr_results = []
+    doc = fitz.open(file_path)
+    for page_index in range(len(doc)):
+        page = doc.load_page(page_index)
+        pix = page.get_pixmap(dpi=300)
+        img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        if pix.n == 4:
+            img_np = np.ascontiguousarray(img_np[..., :3])
+        text_list = reader.readtext(img_np, detail=0)
+        full_text = "\n".join(text_list)
+        ocr_results.append(full_text)
+    doc.close()
+    return ocr_results
 
-    for match in pattern.finditer(text):
-        try:
-            name = match.group(1).strip()
-            rate = float(match.group(2))
-            qty = float(match.group(3))
-            amount = float(match.group(4))
-            
-            items.append(BillItem(
-                item_name=name,
-                item_amount=amount,
-                item_rate=rate,
-                item_quantity=qty
-            ))
-        except:
-            continue
-            
-    return items
-
-# --- 5. AI ENGINE (Regex Mode) ---
-def analyze_document_regex(file_path: str, retries=3):
-    mime_type = "application/pdf" if file_path.endswith(".pdf") else "image/jpeg"
-    uploaded_file = genai.upload_file(file_path, mime_type=mime_type)
-    
-    while uploaded_file.state.name == "PROCESSING":
-        time.sleep(1)
-        uploaded_file = genai.get_file(uploaded_file.name)
-    
-    if uploaded_file.state.name == "FAILED":
-        raise ValueError("Gemini failed.")
-
+def analyze_text_with_retry(ocr_text: str, page_num: int, retries=3):
     system_instruction = """
-    You are a bill extractor. Extract table rows.
-    
-    OUTPUT FORMAT (Strict Text):
-    For every item row found, output a single line in this format:
-    PageNumber | ItemName | Rate | Quantity | NetAmount
-    
-    Example Output:
-    1 | Paracetamol | 10.50 | 2.0 | 21.00
-    1 | Consultation | 500.0 | 1.0 | 500.00
-    
-    RULES:
-    1. Do not use JSON. Use the pipe separator format above.
-    2. Extract all items.
-    3. Ignore Grand Totals.
+    You are a data extractor. I will give you OCR text from a medical bill.
+    Extract the itemized table.
     """
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "page_no": {"type": "string"},
+            "page_type": {
+                "type": "string",
+                "enum": ["Bill Detail", "Final Bill", "Pharmacy", "Summary", "Unknown"]
+            },
+            "bill_items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "item_name": {"type": "string"},
+                        "item_amount": {"type": "number"},
+                        "item_rate": {"type": "number"},
+                        "item_quantity": {"type": "number"}
+                    },
+                    "required": ["item_name", "item_amount"]
+                }
+            }
+        },
+        "required": ["page_no", "page_type", "bill_items"]
+    }
 
     model = genai.GenerativeModel(
         model_name=MODEL_NAME,
-        generation_config={"temperature": 0.1}, 
+        generation_config={
+            "temperature": 0.1,
+            "response_mime_type": "application/json",
+            "response_schema": schema
+        },
         system_instruction=system_instruction
     )
 
-    for attempt in range(retries):
+    prompt = f"Extract items from Page {page_num}. OCR TEXT:\n\n{ocr_text}"
+
+    for _ in range(retries):
         try:
-            response = model.generate_content([uploaded_file, "Extract items."])
-            try: genai.delete_file(uploaded_file.name)
-            except: pass
-            return response
-        except Exception as e:
-            print(f"Retry {attempt+1}: {e}")
+            return model.generate_content(prompt)
+        except Exception:
             time.sleep(2)
 
-    try: genai.delete_file(uploaded_file.name)
-    except: pass
-    raise ValueError("Gemini failed.")
+    raise ValueError("Gemini failed after retries.")
 
-# --- 6. ENDPOINT ---
 @app.post("/extract-bill-data", response_model=APIResponse, response_model_exclude_none=True)
 async def extract_bill_data(request: UserRequest):
     temp_file_path = None
     try:
         temp_file_path = download_file(request.document)
-        
-        # 1. Get Raw Text from AI
-        gemini_response = analyze_document_regex(temp_file_path)
-        raw_text = gemini_response.text
-        
-        # 2. Parse Text with Regex
-        items = parse_gemini_text_response(raw_text)
-        
-        # 3. Construct Response 
-        page_data = PageLineItems(
-            page_no="1",
-            page_type="Bill Detail",
-            bill_items=items
-        )
-        
-        usage = gemini_response.usage_metadata
-        token_usage = TokenUsage(
-            total_tokens=usage.total_token_count,
-            input_tokens=usage.prompt_token_count,
-            output_tokens=usage.candidates_token_count
-        )
+        page_texts = perform_ocr(temp_file_path)
+
+        extracted_pages = []
+        total_tokens = 0
+        input_tokens = 0
+        output_tokens = 0
+
+        for i, text_content in enumerate(page_texts):
+            if not text_content.strip():
+                continue
+
+            gemini_response = analyze_text_with_retry(text_content, i+1)
+            page_data = json.loads(gemini_response.text)
+            page_data["page_no"] = str(i+1)
+            extracted_pages.append(page_data)
+
+            if gemini_response.usage_metadata:
+                usage = gemini_response.usage_metadata
+                total_tokens += usage.total_token_count
+                input_tokens += usage.prompt_token_count
+                output_tokens += usage.candidates_token_count
+
+        total_count = sum(len(p.get("bill_items", [])) for p in extracted_pages)
 
         return APIResponse(
             is_success=True,
-            token_usage=token_usage,
+            token_usage=TokenUsage(
+                total_tokens=total_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens
+            ),
             data=ExtractionData(
-                pagewise_line_items=[page_data],
-                total_item_count=len(items)
+                pagewise_line_items=extracted_pages,
+                total_item_count=total_count
             )
         )
 
     except Exception as e:
-        print(f"Error: {e}")
-        return APIResponse(is_success=False, data=None, error_msg=str(e))
-    
+        return APIResponse(is_success=False, error_msg=str(e))
+
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=7860)
+
+
+
+
