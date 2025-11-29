@@ -2,7 +2,7 @@
 
 This project is a high-performance, AI-powered API designed to extract line-item details from complex medical bills and pharmacy invoices.
 
-It leverages **Google Gemini 2.5 Pro (Multimodal)** to accurately identify table rows, extract financial data, and structure it into JSON, while strictly adhering to accounting rules (preventing double-counting of totals).
+It leverages **Google Gemini 2.5 Pro (Multimodel)** to accurately identify table rows, extract financial data, and structure it into JSON, while strictly adhering to accounting rules (preventing double-counting of totals).
 
 ## 🚀 Live Deployment
 **Base URL:** `https://vansh-nitkurukshetra.onrender.com`
