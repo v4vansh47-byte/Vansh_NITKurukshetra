@@ -2,45 +2,85 @@
 
 This project is a high-performance, AI-powered API designed to extract line-item details from complex medical bills and pharmacy invoices.
 
-It leverages **Google Gemini 2.5 Pro (Multimodel)** to accurately identify table rows, extract financial data, and structure it into JSON, while strictly adhering to accounting rules (preventing double-counting of totals).
+The system now uses **OCR (EasyOCR + PyMuPDF)** to extract raw text from PDFs and images before sending the cleaned text to **Google Gemini 2.5 Pro** for structured line-item extraction.
+
+This hybrid pipeline significantly improves accuracy on noisy scans, multi-page PDFs, and low-quality medical bills.
+
+---
 
 ## 🚀 Live Deployment
-**Base URL:** `https://vansh-nitkurukshetra.onrender.com`
+
+**Hosted On:** Hugging Face Spaces  
+**Base URL:** `https://vansh-nitkurukshetra.hf.space`  
 **Endpoint:** `POST /extract-bill-data`
+
+---
 
 ## ✨ Key Features
 
-* **Multimodal Extraction:** Direct processing of PDFs and Images (JPG, PNG) without intermediate OCR text conversion, preserving spatial layout context.
-* **Intelligent Validation:**
-    * Extracts individual line items (`Medicine`, `Consultation`, `Room Charges`).
-    * **Prevents Double Counting:** Explicitly identifies and excludes "Sub-total", "Brought Forward", and "Grand Total" lines from the item list.
-* **Memory Efficient:** Optimized to run on lightweight cloud instances (removed heavy dependencies like PyTorch/EasyOCR to fit within 512MB RAM limits).
-* **Strict Schema Compliance:** The output format matches the HackRx Postman collection exactly.
+### 🔍 **OCR + AI Hybrid Extraction**
+- Uses **PyMuPDF** to convert PDF pages into high-resolution images.
+- Runs **EasyOCR** on each page to extract accurate page-wise text.
+- Sends OCR output to **Gemini 2.5 Pro** for:
+  - Table row interpretation  
+  - Item name extraction  
+  - Amount, rate, and quantity detection  
+  - Page-type classification
+
+### 🧠 **Intelligent Financial Validation**
+- Extracts detailed line items such as:  
+  *Medicine, Diagnostics, Consultation, Room Charges, Consumables*
+- **Prevents double counting** by excluding:
+  - *Sub-total*
+  - *Brought Forward*
+  - *Grand Total*
+- Handles broken tables, multi-line items, and missing columns.
+
+### ⚡ **Optimized for Hugging Face Spaces**
+- No GPU required
+- Works smoothly within Space CPU-only environment
+- Memory-friendly OCR pipeline suitable for free HF Space plans
+
+### 📦 **Schema-Strict Output**
+Matches the **HackRx Postman collection format exactly**, including:
+- page type
+- validated line items
+- item counts
+- token usage summary
+
+---
 
 ## 🛠️ Tech Stack
 
-* **Language:** Python 3.10+
-* **Framework:** FastAPI
-* **AI Engine:** Google Gemini 2.5 Pro (via `google-generativeai`)
-* **Validation:** Pydantic
-* **Deployment:** Render (Cloud Hosting)
+- **Language:** Python 3.10+
+- **Framework:** FastAPI
+- **OCR Engine:** EasyOCR
+- **PDF Engine:** PyMuPDF (fitz)
+- **AI Model:** Google Gemini 2.5 Pro (via `google-generativeai`)
+- **Validation:** Pydantic (v2)
+- **Hosting:** Hugging Face Spaces (FastAPI Space)
+
+---
 
 ## 📝 API Documentation
 
-### Extract Bill Data
-Extracts structured line items from a document URL.
+### 📌 Extract Bill Data  
+Extracts structured line items from a document URL or local file path.
 
-* **URL:** `/extract-bill-data`
-* **Method:** `POST`
-* **Content-Type:** `application/json`
+- **URL:** `/extract-bill-data`
+- **Method:** `POST`
+- **Content-Type:** `application/json`
 
-#### Request Body
+---
+
+### ✅ Request Body
+
 ```json
 {
   "document": "https://hackrx.blob.core.windows.net/assets/datathon-IIT/sample_2.png?sv=2025-07-05&spr=https&st=2025-11-24T14%3A13%3A22Z&se=2026-11-25T14%3A13%3A00Z&sr=b&sp=r&sig=WFJYfNw0PJdZOpOYlsoAW0XujYGG1x2HSbcDREiFXSU%3D"
 }
-```
-#### Request Body
+### ✅ Response Body
+
 ```json
 {
     "is_success": "boolean",
