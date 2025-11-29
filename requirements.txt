@@ -5,3 +5,8 @@ pydantic
 requests
 python-multipart
 python-dotenv
+easyocr
+numpy
+PyMuPDF
+typing_extensions
+Pillow
