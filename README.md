@@ -11,7 +11,7 @@ This hybrid pipeline significantly improves accuracy on noisy scans, multi-page 
 ## 🚀 Live Deployment
 
 **Hosted On:** Hugging Face Spaces  
-**Base URL:** `https://vansh-nitkurukshetra.hf.space`  
+**Base URL:** `https://Vansh_Sangam_MajorProject_8thSem.hf.space`  
 **Endpoint:** `POST /extract-bill-data`
 
 ---
