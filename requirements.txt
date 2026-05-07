@@ -9,4 +9,3 @@ easyocr
 numpy
 PyMuPDF
 typing_extensions
-Pillow
