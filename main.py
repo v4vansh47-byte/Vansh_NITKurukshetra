@@ -15,6 +15,7 @@ from typing_extensions import Annotated
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+
 load_dotenv()
 GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GENAI_API_KEY:
